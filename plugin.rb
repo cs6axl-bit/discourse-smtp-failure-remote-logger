@@ -2,7 +2,7 @@
 
 # name: discourse-smtp-failure-remote-logger
 # about: Async logs SMTP send failures to a remote PHP endpoint with rich context (recipient email, SMTP provider, exception details).
-# version: 1.0.0
+# version: 1.0.1
 # authors: you
 # required_version: 3.0.0
 
@@ -32,7 +32,7 @@ after_initialize do
     end
 
     def self.hostname
-      @hostname ||= Socket.gethostname rescue nil
+      @hostname ||= (Socket.gethostname rescue nil)
     end
 
     def self.multisite_db
@@ -45,7 +45,7 @@ after_initialize do
 
     # Best-effort extract SMTP config (what Discourse is configured to use).
     # If you have a multi-smtp-router plugin that swaps settings per message,
-    # you can optionally extend this to read from that plugin (see comment below).
+    # you can optionally extend this to read from that plugin (Thread.current, headers, etc.).
     def self.current_smtp_config
       {
         address: SiteSetting.smtp_address,
@@ -55,7 +55,7 @@ after_initialize do
         auth: SiteSetting.smtp_authentication,
         enable_starttls_auto: SiteSetting.smtp_enable_start_tls,
         openssl_verify_mode: SiteSetting.smtp_openssl_verify_mode,
-        force_tls: SiteSetting.force_tls, # may be blank depending on your install
+        force_tls: (SiteSetting.respond_to?(:force_tls) ? SiteSetting.force_tls : nil),
       }
     rescue
       {}
@@ -64,7 +64,6 @@ after_initialize do
     def self.extract_mail_details(mail)
       return {} if mail.nil?
 
-      # Mail gem objects can have arrays / Address objects; normalize.
       to = Array(mail.to).compact.map(&:to_s)
       cc = Array(mail.cc).compact.map(&:to_s)
       bcc = Array(mail.bcc).compact.map(&:to_s)
@@ -86,9 +85,7 @@ after_initialize do
       { mail_extract_error: "#{e.class}: #{safe_str(e.message, 2000)}" }
     end
 
-    def self.extract_discord_user_id(args)
-      # Email::Sender#send signature varies by Discourse version.
-      # We’ll scan args for likely user_id or User.
+    def self.extract_discourse_user_id(args)
       user_id = nil
 
       args.each do |a|
@@ -119,13 +116,13 @@ after_initialize do
 
     def execute(args)
       return unless SiteSetting.smtp_failure_remote_logger_enabled
+
       endpoint = SiteSetting.smtp_failure_remote_logger_endpoint_url
       return if endpoint.blank?
 
       uri = URI.parse(endpoint)
       payload = args["payload"] || {}
 
-      # Add/override a few on-worker fields
       payload["sent_at_utc"] ||= ::SmtpFailureRemoteLogger.now_iso
       payload["worker_hostname"] ||= ::SmtpFailureRemoteLogger.hostname
       payload["rails_env"] ||= Rails.env
@@ -139,29 +136,24 @@ after_initialize do
       req["Content-Type"] = "application/json"
 
       api_key = SiteSetting.smtp_failure_remote_logger_api_key
-      if api_key.present?
-        req["X-API-Key"] = api_key
-      end
+      req["X-API-Key"] = api_key if api_key.present?
 
       req.body = JSON.generate(payload)
 
       res = http.request(req)
 
-      # Non-2xx -> raise so Sidekiq retries (so you don't silently lose logs)
       unless res.is_a?(Net::HTTPSuccess)
         raise "Remote log endpoint returned #{res.code} #{res.message}: #{res.body.to_s[0, 2000]}"
       end
     end
   end
 
-  # Patch Email::Sender#send to catch failures and enqueue async log.
   module ::SmtpFailureRemoteLogger
     module EmailSenderPatch
       def send(*args)
         super(*args)
       rescue => e
         begin
-          # Try to find the Mail::Message object in args or ivars.
           mail_obj = nil
           args.each do |a|
             if a.class.name.to_s == "Mail::Message" || (a.respond_to?(:to) && a.respond_to?(:subject))
@@ -170,19 +162,17 @@ after_initialize do
             end
           end
 
-          # Some Discourse versions store it on @message or @mail
           mail_obj ||= (instance_variable_defined?(:@message) ? instance_variable_get(:@message) : nil)
           mail_obj ||= (instance_variable_defined?(:@mail) ? instance_variable_get(:@mail) : nil)
 
           mail_details = ::SmtpFailureRemoteLogger.extract_mail_details(mail_obj)
 
-          # If user asked specifically for "user email", pick the first recipient
-          # (usually it's the target user).
-          primary_recipient = (mail_details[:to].is_a?(Array) ? mail_details[:to].first : nil)
+          primary_recipient =
+            (mail_details[:to].is_a?(Array) ? mail_details[:to].first : nil)
 
           include_emails = SiteSetting.smtp_failure_remote_logger_include_recipient_emails
-          if !include_emails
-            # If you disable this, we still keep domains for debugging deliverability/provider behavior.
+
+          unless include_emails
             if mail_details[:to].is_a?(Array)
               mail_details[:to_domains] = mail_details[:to].map { |x| x.to_s.split("@", 2)[1].to_s.downcase }.uniq
               mail_details.delete(:to)
@@ -199,21 +189,18 @@ after_initialize do
 
           smtp_cfg = ::SmtpFailureRemoteLogger.current_smtp_config
 
-          # If you have a multi-smtp-router plugin that chooses SMTP per message:
-          # You can extend smtp_cfg here by reading whatever that plugin stores
-          # (e.g., Thread.current vars, custom headers, etc.) if available.
+          discourse_host = (Discourse.current_hostname rescue nil)
 
           payload = {
             event: "smtp_send_failure",
             plugin: ::SmtpFailureRemoteLogger::PLUGIN_NAME,
             uuid: SecureRandom.uuid,
             occurred_at_utc: ::SmtpFailureRemoteLogger.now_iso,
-            discourse_hostname: Discourse.current_hostname rescue nil,
+            discourse_hostname: discourse_host,
             multisite_db: ::SmtpFailureRemoteLogger.multisite_db,
             server_hostname: ::SmtpFailureRemoteLogger.hostname,
 
-            # “user email” (requested) — only if include_recipient_emails is enabled
-            primary_recipient: include_emails ? primary_recipient : nil,
+            primary_recipient: (include_emails ? primary_recipient : nil),
 
             mail: mail_details,
             smtp: smtp_cfg,
@@ -224,20 +211,17 @@ after_initialize do
               backtrace: (e.backtrace || [])[0, SiteSetting.smtp_failure_remote_logger_backtrace_lines.to_i],
             },
 
-            # A few extra hints:
             ruby: RUBY_VERSION,
             rails: Rails.version,
           }
 
-          # Try to include a user id if we can detect one.
-          user_id = ::SmtpFailureRemoteLogger.extract_discord_user_id(args)
+          user_id = ::SmtpFailureRemoteLogger.extract_discourse_user_id(args)
           payload[:user_id] = user_id if user_id
 
           if ::SmtpFailureRemoteLogger.enabled?
             ::Jobs.enqueue(:smtp_failure_remote_logger_post, payload: payload)
           end
         rescue => log_err
-          # Never block/rewrite the original failure if logging fails.
           Rails.logger.warn("[#{::SmtpFailureRemoteLogger::PLUGIN_NAME}] logging failed: #{log_err.class}: #{log_err.message}")
         end
 
@@ -246,7 +230,6 @@ after_initialize do
     end
   end
 
-  # Apply patch
   if defined?(::Email::Sender)
     ::Email::Sender.prepend(::SmtpFailureRemoteLogger::EmailSenderPatch)
   else
