@@ -1,0 +1,31 @@
+plugins:
+  smtp_failure_remote_logger_enabled:
+    default: false
+    client: false
+
+  smtp_failure_remote_logger_endpoint_url:
+    default: ""
+    type: text
+    client: false
+
+  smtp_failure_remote_logger_api_key:
+    default: ""
+    type: text
+    client: false
+
+  smtp_failure_remote_logger_timeout_seconds:
+    default: 5
+    min: 1
+    max: 30
+    client: false
+
+  smtp_failure_remote_logger_backtrace_lines:
+    default: 60
+    min: 0
+    max: 300
+    client: false
+
+  # You asked to include the user email; keep this ON unless you want privacy-safe logs.
+  smtp_failure_remote_logger_include_recipient_emails:
+    default: true
+    client: false
